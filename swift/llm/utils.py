@@ -238,6 +238,9 @@ def save_checkpoint(model: Optional[PreTrainedModel],
             copy_files_by_pattern(model.model_dir, output_dir, '*.json')
     processor.save_pretrained(output_dir)
 
+    if model and not hasattr(model, 'model_dir'):
+        model.model_dir = None
+
     if model_dirs is None:
         model_dirs = []
     else:

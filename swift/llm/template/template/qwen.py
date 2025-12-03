@@ -57,7 +57,7 @@ register_template(
 
 
 class Qwen3Template(ThinkingTemplate):
-    no_think_prefix = '<think>\n\n</think>\n\n'
+    no_think_prefix = '' # '<think>\n\n</think>\n\n'
 
 
 register_template(QwenTemplateMeta(LLMTemplateType.qwen3, default_system=None, template_cls=Qwen3Template))
