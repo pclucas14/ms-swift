@@ -14,7 +14,7 @@ import torch.nn
 from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.num_microbatches_calculator import get_num_microbatches
-from megatron.core.optimizer import _update_min_and_max_lr_in_param_groups, param_group_identifier_keys
+from megatron.core.optimizer import _update_min_and_max_lr_in_param_groups
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.rerun_state_machine import RerunMode, get_rerun_state_machine
 from megatron.core.transformer.module import MegatronModule
@@ -22,7 +22,7 @@ from megatron.core.transformer.moe.moe_utils import track_moe_metrics
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.utils import StragglerDetector
 from megatron.training import (checkpointing, ft_integration, get_args, get_model, get_tensorboard_writer, get_timers,
-                               get_wandb_writer, is_last_rank, one_logger_utils, pretrain, print_rank_0,
+                               get_wandb_writer, initialize, is_last_rank, one_logger_utils, pretrain, print_rank_0,
                                print_rank_last, training)
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.theoretical_memory_usage import report_theoretical_memory
@@ -31,7 +31,7 @@ from megatron.training.utils import reduce_max_stat_across_model_parallel_group,
 from packaging import version
 from tqdm.auto import tqdm
 
-from swift.llm import dynamic_gradient_checkpointing
+from swift.llm import Template, dynamic_gradient_checkpointing
 from swift.plugin import MeanMetric
 from swift.trainers import SwiftMixin
 from swift.utils import JsonlWriter, deep_getattr, format_time, get_logger
@@ -40,16 +40,22 @@ from ..utils import adapter_state_dict_context, copy_original_module_weight, pat
 from .utils import (get_batch_on_this_cp_rank, get_batch_on_this_tp_rank, get_packed_seq_params,
                     get_swift_datasets_provider)
 
+try:
+    from megatron.core.optimizer import param_group_identifier_keys
+except ImportError:
+    param_group_identifier_keys = None
+
 logger = get_logger()
 
 
 class BaseMegatronTrainer(ABC):
 
-    def __init__(self, args, template):
+    def __init__(self, args, template: Template):
         self.args = args
         self.template = template
         self.stimer = StragglerDetector()
         self.unwrapped_models = []
+        self.wrapped_models = []
         self.peft_models = []
         self._bridge = None
         logging_path = os.path.join(args.save, 'logging.jsonl')
@@ -64,7 +70,7 @@ class BaseMegatronTrainer(ABC):
             'train': collections.defaultdict(_get_mean_metric),
             'eval': collections.defaultdict(_get_mean_metric)
         }
-        self.megatron_core_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
+        self.mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
 
     @property
     def bridge(self):
@@ -75,17 +81,28 @@ class BaseMegatronTrainer(ABC):
     @contextmanager
     def _get_iters(self, train_dataset, val_dataset):
         origin_initialize_megatron = training.initialize_megatron
+        origin_validate_args = initialize.validate_args
 
         def initialize_megatron(*_args, **kwargs):
             res = origin_initialize_megatron(*_args, **kwargs)
             args = get_args()
             data_parallel_size = mpu.get_data_parallel_world_size()
             step_batch_size = args.micro_batch_size * data_parallel_size
-            if args.train_iters is None and args.max_epochs is not None:
+            num_generations = args.num_generations if args.rlhf_type == 'grpo' else 1
+            if args.save_strategy == 'epoch':
                 if hasattr(train_dataset, '__len__'):
-                    dataset_sample = len(train_dataset) // step_batch_size * step_batch_size
-                    args.train_iters = dataset_sample * args.max_epochs // args.global_batch_size
+                    dataset_sample = len(train_dataset) // step_batch_size * step_batch_size * num_generations
+                    args.save_interval = dataset_sample // args.global_batch_size
+                    args.eval_interval = args.save_interval
+                    if getattr(args, 'save_retain_interval', None) is not None:
+                        args.save_retain_interval *= args.save_interval
                 else:
+                    raise ValueError('streaming dataset is not supported with `--save_strategy epoch`.')
+            if args.max_epochs is not None:
+                if hasattr(train_dataset, '__len__'):
+                    dataset_sample = len(train_dataset) // step_batch_size * step_batch_size * num_generations
+                    args.train_iters = dataset_sample * args.max_epochs // args.global_batch_size
+                elif args.train_iters is None:
                     raise ValueError(
                         'You are using a streaming training dataset. Please explicitly specify `--train_iters`.')
             if args.eval_iters < 0:
@@ -93,6 +110,7 @@ class BaseMegatronTrainer(ABC):
                     args.eval_iters = 0
                 elif hasattr(val_dataset, '__len__'):
                     dataset_sample = len(val_dataset) // step_batch_size * step_batch_size
+                    dataset_sample = dataset_sample * num_generations
                     args.eval_iters = max(dataset_sample // args.global_batch_size, 1)
                 else:
                     raise ValueError(
@@ -100,39 +118,39 @@ class BaseMegatronTrainer(ABC):
                 logger.info(f'Setting args.eval_iters: {args.eval_iters}')
             return res
 
+        def validate_args(args, *_args, **kwargs):
+            return origin_validate_args(args, *_args, **kwargs)
+
         training.initialize_megatron = initialize_megatron
+        initialize.validate_args = validate_args
         try:
             yield
         finally:
             training.initialize_megatron = origin_initialize_megatron
+            initialize.validate_args = origin_validate_args
 
     def new_cyclic_iter(self, iterable):
+        training = self.unwrapped_models[0].training
+        if not training:
+            yield from self._origin_cyclic_iter(iterable)
+            return
+
         args = get_args()
-        i = 0
-        n_batch = 0
+        n_epoch = 0
+        is_finished = False
         while True:
-            training = self.unwrapped_models[0].training
-            if training:
-                logger.info(f'The training of Epoch {i} starts...')
-            if training and args.max_epochs and i >= args.max_epochs - 1:
-                it = iter(iterable)
-                num_microbatches = args.global_batch_size // (args.micro_batch_size * args.data_parallel_size)
-                x = [next(it) for _ in range(num_microbatches - n_batch % num_microbatches)]
-                while True:
-                    try:
-                        next_x = [next(it) for _ in range(num_microbatches)]
-                    except StopIteration:
-                        break
-                    yield from x
-                    x = next_x
-                logger.info(f'Training of {i + 1} epochs has been completed, the training has finished.')
-                x[0]['is_finished'] = True
-                yield from x
-            else:
-                for x in iterable:
-                    n_batch += 1
-                    yield x
-            i += 1
+            if not is_finished:
+                logger.info(f'The training of Epoch {n_epoch} starts...')
+            for x in iterable:
+                yield x
+            if training and args.max_epochs and n_epoch >= args.max_epochs - 1:
+                is_finished = True
+            n_epoch += 1
+            if is_finished:
+                # streaming
+                # Note that this approach will train for one additional step.
+                logger.info(f'Training of {n_epoch} epochs has been completed, the training has finished.')
+                args.train_iters = args.curr_iteration + 1
 
     def _replace_data_iterator(self, data_iterator, model):
         return data_iterator
@@ -276,7 +294,10 @@ class BaseMegatronTrainer(ABC):
         Returns:
             List of parameter groups.
         """
-
+        if self.args.vit_lr is not None or self.args.aligner_lr is not None:
+            vit_lr = self.args.vit_lr if self.args.vit_lr is not None else self.args.lr
+            aligner_lr = self.args.aligner_lr if self.args.aligner_lr is not None else self.args.lr
+            logger.info(f'vit_lr: {vit_lr}, aligner_lr: {aligner_lr}, llm_lr: {self.args.lr}')
         use_decoupled_learning_rate = decoupled_lr is not None
 
         # Map (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr) to params.
@@ -363,7 +384,8 @@ class BaseMegatronTrainer(ABC):
             }
             # Ensure param_group has required keys for matching when loading optimizer state
             # See MegatronOptimizer._filter_and_reorder_param_groups.
-            assert set(param_group.keys()) - set(param_group_identifier_keys) == {'params'}
+            if param_group_identifier_keys is not None:
+                assert set(param_group.keys()) - set(param_group_identifier_keys) == {'params'}
             param_groups.append(param_group)
 
         param_groups = _update_min_and_max_lr_in_param_groups(
@@ -413,6 +435,7 @@ class BaseMegatronTrainer(ABC):
         with self._patch_load_state_dict(self._load_base_checkpoint), self._patch_get_param_groups():
             model, optimizer, opt_param_scheduler = self._origin_setup_model_and_optimizer(
                 new_model_provider_func, model_type, *_args, **kwargs)
+        self.wrapped_models = model
         if args.initialize_embedding:
             for m in self.unwrapped_models:
                 self._initialize_embedding(m)
@@ -471,8 +494,7 @@ class BaseMegatronTrainer(ABC):
     def _all_reduce_metric(self,
                            metric: Dict[str, torch.Tensor],
                            reduction=torch.distributed.ReduceOp.AVG) -> Dict[str, torch.Tensor]:
-        values = list(metric.values())
-        reporting_metric = values[0].new_tensor(values)
+        reporting_metric = torch.stack(list(metric.values()), dim=0)
         torch.distributed.all_reduce(reporting_metric, reduction, group=mpu.get_data_parallel_group())
         return {k: reporting_metric[i] for i, k in enumerate(metric.keys())}
 
@@ -559,7 +581,7 @@ class BaseMegatronTrainer(ABC):
                     torch.cuda.empty_cache()
 
                 if mpu.is_pipeline_last_stage(ignore_virtual=True):
-                    if self.megatron_core_013:
+                    if self.mcore_013:
                         for key in loss_dicts[0].keys():
                             if key not in total_loss_dict:
                                 total_loss_dict[key] = torch.tensor([0.0, 0.0], dtype=torch.float).cuda()
@@ -775,6 +797,7 @@ class BaseMegatronTrainer(ABC):
                 track_names.append('load_balancing_loss')
             if args.moe_z_loss_coeff is not None:
                 track_names.append('z_loss')
+            track_moe_kwargs = {'mtp_num_layers': args.mtp_num_layers} if self.mcore_013 else {}
             track_moe_metrics(
                 loss_scale=moe_loss_scale,
                 iteration=iteration,
@@ -785,7 +808,8 @@ class BaseMegatronTrainer(ABC):
                 force_initialize=True,
                 track_names=track_names,
                 num_layers=args.num_layers,
-                moe_layer_freq=args.moe_layer_freq)
+                moe_layer_freq=args.moe_layer_freq,
+                **track_moe_kwargs)
         if args.mtp_num_layers is not None:
             mtp_loss_scale = 1 / get_num_microbatches()
             MTPLossLoggingHelper.track_mtp_metrics(mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict)
@@ -896,19 +920,21 @@ class BaseMegatronTrainer(ABC):
 
     def merge_lora_adapters(self, adapter_name='default'):
         """Merge LoRA adapters into base model weights for vLLM inference."""
-        for model in self.unwrapped_models:
-            for module in model.modules():
-                if isinstance(module, LoraParallelLinear):
-                    # Merge all active adapters
-                    module.merge(adapter_names=[adapter_name])
+        with torch.no_grad():
+            for model in self.unwrapped_models:
+                for module in model.modules():
+                    if isinstance(module, LoraParallelLinear):
+                        # Merge all active adapters
+                        module.merge(adapter_names=[adapter_name])
 
     def unmerge_lora_adapters(self):
         """Unmerge LoRA adapters to restore training state."""
-        for model in self.unwrapped_models:
-            for module in model.modules():
-                if isinstance(module, LoraParallelLinear):
-                    # Unmerge to restore separate LoRA weights for training
-                    module.unmerge()
+        with torch.no_grad():
+            for model in self.unwrapped_models:
+                for module in model.modules():
+                    if isinstance(module, LoraParallelLinear):
+                        # Unmerge to restore separate LoRA weights for training
+                        module.unmerge()
 
     def save_checkpoint(self, iteration, *_args, **kwargs):
         args = get_args()
@@ -924,7 +950,7 @@ class BaseMegatronTrainer(ABC):
                     shutil.copy(args_path, os.path.join(output_dir, 'args.json'))
         else:
             with adapter_state_dict_context(is_peft_format=save_peft_format):
-                return self._origin_save_checkpoint(iteration, *_args, **kwargs)
+                self._origin_save_checkpoint(iteration, *_args, **kwargs)
         if args.train_type == 'lora' and args.merge_lora:
             self.unmerge_lora_adapters()
 
@@ -932,6 +958,7 @@ class BaseMegatronTrainer(ABC):
         # support max_epochs
         self._origin_train_step = training.train_step
         training.train_step = self.train_step
+        self._origin_cyclic_iter = training.cyclic_iter
         training.cyclic_iter = self.new_cyclic_iter
         # patch training_log
         self._origin_training_log = training.training_log
@@ -950,8 +977,9 @@ class BaseMegatronTrainer(ABC):
         args = get_args()
         visual_cls = self.args.megatron_model_meta.visual_cls
         if args.train_type == 'full' and args.is_multimodal and visual_cls is not None:
-            vision_tower = [f'visual.{vit}' for vit in visual_cls._vision_tower]
-            aligner = [f'visual.{aligner}' for aligner in visual_cls._aligner]
+            vision_tower = [f'visual.{vit}' for vit in getattr(visual_cls, '_vision_tower', [])]
+            aligner = [f'visual.{aligner}' for aligner in getattr(visual_cls, '_aligner', [])]
+            generator = [f'visual.{generator}' for generator in getattr(visual_cls, '_generator', [])]
             if args.freeze_llm:
                 args.freeze_parameters.append('language_model')
             if args.freeze_vit:
@@ -960,6 +988,7 @@ class BaseMegatronTrainer(ABC):
                 args.freeze_parameters += aligner
             else:
                 args.trainable_parameters += aligner
+            args.freeze_parameters += generator
             if args.freeze_parameters:
                 logger.info(f'freeze_parameters: {args.freeze_parameters}')
             if args.trainable_parameters:
@@ -1006,6 +1035,7 @@ class BaseMegatronTrainer(ABC):
             num_samples = batch.pop('num_samples')
         args = get_args()
         text_position_ids = batch.pop('text_position_ids', None)
+        batch.pop('attention_mask_2d', None)
         if text_position_ids is None:
             text_position_ids = batch.get('position_ids')
         if args.padding_free and text_position_ids is not None:
@@ -1017,9 +1047,4 @@ class BaseMegatronTrainer(ABC):
 
     def get_batch(self, data_iterator, vp_stage=None):
         """Generate a batch."""
-        args = get_args()
-        data = next(data_iterator)
-        is_finished = data.pop('is_finished', False)
-        if is_finished:
-            args.train_iters = args.curr_iteration + 1
-        return self._prepare_batch(data, vp_stage)
+        return self._prepare_batch(next(data_iterator), vp_stage)

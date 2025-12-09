@@ -42,7 +42,8 @@ from swift.llm import BatchSamplerShard, DataLoaderDispatcher, DataLoaderShard, 
 from swift.llm.utils import update_generation_config_eos_token
 from swift.plugin import MeanMetric, compute_acc, extra_tuners, get_loss_func, get_metric
 from swift.tuners import SwiftModel
-from swift.utils import get_current_device, get_logger, is_dist, is_mp, is_mp_ddp, ms_logger_context, seed_worker
+from swift.utils import (get_current_device, get_last_valid_indices, get_logger, is_dist, is_mp, is_mp_ddp,
+                         ms_logger_context, seed_worker)
 from ..llm.model.patcher import get_lm_head_model, revert_padding_free, transformers_seq_cls_forward
 from .arguments import TrainingArguments
 from .utils import can_return_loss, find_labels, get_function, is_instance_of_ms_model
@@ -281,15 +282,17 @@ class SwiftMixin:
 
             _unwrap_model = unwrap_model(self.model)
             if isinstance(_unwrap_model, supported_classes):
+                save_kwargs = {'state_dict': state_dict}
+                if isinstance(_unwrap_model, PeftModel):
+                    save_kwargs['selected_adapters'] = ['default']
                 if use_flash_ckpt:
                     _unwrap_model.save_pretrained(
                         output_dir,
-                        state_dict=state_dict,
                         safe_serialization=False,
-                        save_function=self.flash_checkpointer.ckpt_agent.save)
+                        save_function=self.flash_checkpointer.ckpt_agent.save,
+                        **save_kwargs)
                 else:
-                    _unwrap_model.save_pretrained(
-                        output_dir, state_dict=state_dict, safe_serialization=save_safetensors)
+                    _unwrap_model.save_pretrained(output_dir, safe_serialization=save_safetensors, **save_kwargs)
             else:
                 logger.info('Trainer.model is not a `PreTrainedModel`, only saving its state dict.')
                 if use_flash_ckpt:
@@ -333,14 +336,17 @@ class SwiftMixin:
                 self.model, output_dir, state_dict=state_dict, safe_serialization=save_safetensors)
         else:
             if self.model.__class__.__name__ != 'SentenceTransformer':
+                save_kwargs = {'state_dict': state_dict}
+                if isinstance(self.model, PeftModel):
+                    save_kwargs['selected_adapters'] = ['default']
                 if use_flash_ckpt:
                     self.model.save_pretrained(
                         output_dir,
-                        state_dict=state_dict,
                         safe_serialization=False,
-                        save_function=self.flash_checkpointer.ckpt_agent.save)
+                        save_function=self.flash_checkpointer.ckpt_agent.save,
+                        **save_kwargs)
                 else:
-                    self.model.save_pretrained(output_dir, state_dict=state_dict, safe_serialization=save_safetensors)
+                    self.model.save_pretrained(output_dir, safe_serialization=save_safetensors, **save_kwargs)
             else:
 
                 @contextmanager
@@ -907,7 +913,7 @@ class SwiftMixin:
         else:
             super().create_optimizer_and_scheduler(num_training_steps=num_training_steps)
 
-    def _compute_acc(self, outputs, labels, cu_seqlens=None) -> None:
+    def _compute_acc(self, outputs, labels, cu_seqlens=None, attention_mask=None) -> None:
         args = self.args
         logits = outputs.logits
         metrics = None
@@ -932,8 +938,20 @@ class SwiftMixin:
 
             if isinstance(positive_token_id, int) and isinstance(negative_token_id, int) \
                     and positive_token_id >= 0 and negative_token_id >= 0:
-                positive_logits = logits[:, -1, positive_token_id]
-                negative_logits = logits[:, -1, negative_token_id]
+                # Handle right padding by finding the last valid token position
+                if attention_mask is not None:
+                    # Extract logits at the last valid (non-padding) token position for each sample
+                    batch_size = logits.shape[0]
+                    last_valid_indices = get_last_valid_indices(attention_mask)
+                    batch_indices = torch.arange(batch_size, device=logits.device)
+                    last_valid_logits = logits[batch_indices, last_valid_indices, :]
+                    positive_logits = last_valid_logits[:, positive_token_id]
+                    negative_logits = last_valid_logits[:, negative_token_id]
+                else:
+                    # Fallback to original behavior if attention_mask is not available
+                    positive_logits = logits[:, -1, positive_token_id]
+                    negative_logits = logits[:, -1, negative_token_id]
+
                 binary_preds = (positive_logits > negative_logits).long()
                 metrics = compute_acc(
                     binary_preds,
@@ -996,12 +1014,15 @@ class SwiftMixin:
         from evalscope import TaskConfig, run_task
 
         self.model.eval()
+        template = copy(self.template)
+        template.packing = False
+        template.padding_free = False
         # prepare task config
         task_config_kwargs = dict(
             model=EvalModel(
                 model_name=f'model-step{self.state.global_step}',
                 model=self.model,
-                template=self.template,
+                template=template,
                 max_batch_size=self.args.per_device_eval_batch_size,
             ),
             eval_type='swift_custom',
