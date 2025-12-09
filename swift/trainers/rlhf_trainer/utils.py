@@ -14,6 +14,7 @@ import datasets
 import torch
 import torch.nn.functional as F
 from msgspec import field
+from packaging import version
 from peft.tuners import lora
 from peft.tuners.lora import LoraLayer
 from PIL import Image
@@ -609,7 +610,6 @@ def replace_assistant_response_with_ids(messages: 'Messages',
 
 def patch_save_last_checkpoint():
     import trl
-    from packaging import version
     if version.parse(trl.__version__) >= version.parse('0.20'):
         return
 
@@ -1017,7 +1017,7 @@ def compute_chord_loss(trainer, grpo_loss: torch.Tensor) -> torch.Tensor:
         chord_sft_loss = per_token_loss_func(outputs, labels)
 
         if trainer.args.chord_enable_phi_function:
-            per_token_probs = torch.exp(-chord_sft_loss)
+            per_token_probs = torch.exp(-chord_sft_loss.detach())
             phi = per_token_probs * (1 - per_token_probs)
             chord_sft_loss *= phi
 
@@ -1169,6 +1169,18 @@ def get_even_process_data(trainer, global_data: List[T]) -> List[T]:
         end = start + base_size
 
     return global_data[start:end]
+
+
+def check_vllm_version_ge(min_version: str) -> bool:
+    """check if the vllm version is greater than or equal to the minimum version"""
+    if not is_vllm_available():
+        return False
+    import vllm
+    vllm_version = vllm.__version__
+    # if dev version, regard it as latest version
+    if vllm_version is None or 'dev' in vllm_version:
+        return True
+    return version.parse(vllm_version) >= version.parse(min_version)
 
 
 # ============================================================================

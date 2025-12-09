@@ -69,6 +69,10 @@ class RLHFMegatronArgumentsMixin:
     vllm_enforce_eager: bool = False
     vllm_limit_mm_per_prompt: Optional[Union[dict, str]] = None  # '{"image": 5, "video": 2}'
     vllm_disable_cascade_attn: bool = False
+    vllm_max_num_seqs: Optional[int] = None
+    vllm_mm_processor_cache_gb: Optional[float] = None
+    vllm_engine_kwargs: Optional[Dict[str, Any]] = None
+
     sleep_level: Literal[0, 1, 2] = 0
     offload_optimizer: bool = False
     offload_model: bool = False
@@ -78,7 +82,7 @@ class RLHFMegatronArgumentsMixin:
     vllm_server_host: Optional[List[str]] = None
     vllm_server_port: List[int] = field(default_factory=lambda: [8000])
     vllm_server_timeout: float = 240.0
-    vllm_server_group_port: List[int] = field(default_factory=lambda: [51216])
+    vllm_server_group_port: Optional[List[int]] = None
 
     reward_funcs: List[str] = field(default_factory=list)
     reward_weights: List[float] = None
@@ -113,6 +117,7 @@ class RLHFMegatronArgumentsMixin:
     rollout_importance_sampling_mode: Optional[Literal['token_truncate', 'token_mask', 'sequence_truncate',
                                                        'sequence_mask']] = None
     rollout_importance_sampling_threshold: float = 2.0
+    log_rollout_offpolicy_metrics: bool = False
 
     # ───────────────────────────  Not Supported Yet  ───────────────────────────
 
@@ -161,6 +166,9 @@ class RLHFMegatronArgumentsMixin:
             self._init_kto()
         if self.rlhf_type == 'grpo':
             self._init_grpo()
+            if self.vllm_limit_mm_per_prompt is not None:
+                self.vllm_limit_mm_per_prompt = json_parse_to_dict(self.vllm_limit_mm_per_prompt)
+            self.vllm_engine_kwargs = json_parse_to_dict(self.vllm_engine_kwargs)
 
     def _init_grpo(self):
 
@@ -209,6 +217,9 @@ class RLHFMegatronArgumentsMixin:
                                  f'Please adjust generation_batch_size/steps_per_generation/num_generations.')
 
             per_device_num_rollout_prompt = num_rollout_prompt // dp_size
+            assert per_device_num_rollout_prompt >= 1, \
+                (f'per_device_num_rollout_prompt ({per_device_num_rollout_prompt}) must be greater than 1, '
+                 f'please adjust generation_batch_size/steps_per_generation/num_generations to make it greater than 1')
 
             if per_device_num_rollout_prompt % self.micro_batch_size != 0:
                 raise ValueError(f'Per-device rollout prompt count ({per_device_num_rollout_prompt}) = '
@@ -220,6 +231,9 @@ class RLHFMegatronArgumentsMixin:
                                  f'micro_batch_size == 0')
 
             self.per_device_generation_batch_size = self.generation_batch_size // world_size
+            assert self.per_device_generation_batch_size >= 1, \
+                (f'per_device_generation_batch_size ({self.per_device_generation_batch_size}) must be greater than 1, '
+                 f'please adjust generation_batch_size/steps_per_generation/num_generations to make it greater than 1')
 
         _check_not_supported()
         _check_batch_params()
@@ -314,6 +328,7 @@ class ExtraMegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     task_type: Literal['causal_lm', 'seq_cls'] = None
     num_labels: Optional[int] = None
     problem_type: Literal['regression', 'single_label_classification', 'multi_label_classification'] = None
+    save_strategy: Literal['steps', 'epoch'] = 'steps'
 
     original_max_position_embeddings: Optional[int] = None
     partial_rotary_factor: Optional[float] = None
@@ -435,6 +450,9 @@ class MegatronArguments(ExtraMegatronArguments):
     pipeline_model_parallel_size: int = 1
     decoder_first_pipeline_num_layers: Optional[int] = None
     decoder_last_pipeline_num_layers: Optional[int] = None
+    account_for_embedding_in_pipeline_split: bool = False
+    account_for_loss_in_pipeline_split: bool = False
+
     sequence_parallel: bool = False
     context_parallel_size: int = 1
     tp_comm_overlap: bool = False
@@ -666,11 +684,15 @@ class MegatronArguments(ExtraMegatronArguments):
                 require_version('peft>=0.12')
         RLHFMegatronArgumentsMixin.__post_init__(self)
         MegatronTunerMixin.__post_init__(self)
-        os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
+        os.environ.setdefault('CUDA_DEVICE_MAX_CONNECTIONS', '1')
         self._set_default()
         self.model_info, self.model_meta = get_model_info_meta(
             self.model, model_type=self.model_type, use_hf=self.use_hf, hub_token=self.hub_token)
         self.model_type = self.model_info.model_type
+        if self.pipeline_model_parallel_size == 1 and (self.decoder_first_pipeline_num_layers is not None
+                                                       or self.decoder_last_pipeline_num_layers is not None):
+            raise ValueError('pipeline_model_parallel_size must be greater than 1 if you want to set '
+                             'decoder_first_pipeline_num_layers or decoder_last_pipeline_num_layers.')
         if hasattr(self, 'ddp_timeout'):
             self.distributed_timeout_minutes = self.ddp_timeout // 60
         self._patch_megatron_timeout(self.distributed_timeout_minutes)
@@ -683,6 +705,9 @@ class MegatronArguments(ExtraMegatronArguments):
             self.untie_embeddings_and_output_weights = True
         if self.gradient_checkpointing_kwargs is not None:
             self.gradient_checkpointing_kwargs = json_parse_to_dict(self.gradient_checkpointing_kwargs)
+        if self.save_strategy == 'epoch':
+            self.save_interval = 1
+            self.eval_interval = 1
         if self.eval_interval is None:
             self.eval_interval = self.save_interval
         if self.seq_length is None:

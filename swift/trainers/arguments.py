@@ -423,6 +423,7 @@ class RolloutTrainerArgumentsMixin(VllmArguments):
     use_vllm: bool = False
     vllm_mode: Literal['server', 'colocate'] = 'colocate'
     # internal vllm (colocate)
+    vllm_max_num_seqs: Optional[int] = None
     vllm_enable_prefix_caching: bool = True  # overwrite
     vllm_enable_lora: bool = False
     lora_rank: int = 8  # for vllm lora adapter
@@ -432,7 +433,7 @@ class RolloutTrainerArgumentsMixin(VllmArguments):
     vllm_server_port: List[int] = field(default_factory=lambda: [8000])
     vllm_server_timeout: float = 240.0
     vllm_client = None  # Not required to set, used for client instantiation
-    vllm_server_group_port: List[int] = field(default_factory=lambda: [51216])
+    vllm_server_group_port: Optional[List[int]] = None
     enable_flattened_weight_sync: bool = True
     async_generate: bool = False
 
@@ -533,6 +534,9 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
             See the documentation for details.
         rollout_importance_sampling_threshold (float): The threshold for importance sampling weights, used to truncate
             or mask extreme weights. Defaults to 2.0.
+        log_rollout_offpolicy_metrics (bool): Whether to log rollout off-policy diagnostic metrics (KL, PPL, chi2, etc.)
+            when `rollout_importance_sampling_mode` is not set. When `rollout_importance_sampling_mode` is set,
+            metrics are always logged regardless of this setting. Defaults to False.
     """
     epsilon: float = 0.2
     epsilon_high: Optional[float] = None
@@ -602,6 +606,7 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
     rollout_importance_sampling_mode: Optional[Literal['token_truncate', 'token_mask', 'sequence_truncate',
                                                        'sequence_mask']] = None
     rollout_importance_sampling_threshold: float = 2.0  # Threshold for truncation/masking (C in paper)
+    log_rollout_offpolicy_metrics: bool = False  # Log off-policy metrics even when IS correction is disabled
 
 
 @dataclass
