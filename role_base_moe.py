@@ -30,16 +30,21 @@ class RoleBasedRouter(nn.Module):
         super().__init__()
         self.original_gate = original_gate
         self.num_experts = num_experts
-        self.current_role = None
+        self.token_roles = None  # Will store role for each token position
         self.use_role_routing = True
         
-    def set_role(self, role: str):
-        """Set the current role for routing decisions."""
-        self.current_role = role
+    def set_token_roles(self, token_roles: torch.Tensor):
+        """Set the role mapping for each token position.
+        
+        Args:
+            token_roles: Tensor of shape [seq_len] with role indices:
+                         0 for user/system, 1 for assistant, -1 for padding
+        """
+        self.token_roles = token_roles
         
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
-        Route based on current role. Returns router logits.
+        Route based on token roles. Returns router logits.
         
         Args:
             hidden_states: Can be 2D [batch_size * seq_len, hidden_dim] or 
@@ -48,42 +53,48 @@ class RoleBasedRouter(nn.Module):
         Returns:
             router_logits: Logits for all experts
         """
-        if not self.use_role_routing or self.current_role is None:
-            breakpoint()
+        if not self.use_role_routing or self.token_roles is None:
             # Fall back to original routing
             return self.original_gate(hidden_states)
-        
-        # Determine which expert to use based on role
-        if self.current_role in ['user', 'system']:
-            expert_idx = 0
-        elif self.current_role == 'assistant':
-            expert_idx = 1
-        else:
-            # Default to expert 0 for unknown roles
-            expert_idx = 0
         
         # Handle both 2D and 3D inputs
         if hidden_states.dim() == 2:
             batch_tokens, hidden_dim = hidden_states.shape
-            # Create logits: very high logit for selected expert, very low for others
+            # Create logits based on token roles
             router_logits = torch.full(
                 (batch_tokens, self.num_experts),
                 -1e9,  # Very low logit
                 dtype=hidden_states.dtype,
                 device=hidden_states.device
             )
-            router_logits[:, expert_idx] = 1e9  # Very high logit for selected expert
+            
+            # Flatten token_roles if needed and apply routing
+            token_roles_flat = self.token_roles.view(-1)[:batch_tokens]
+            
+            # Route tokens to expert 0 (user/system) or expert 1 (assistant)
+            expert_0_mask = token_roles_flat == 0
+            expert_1_mask = token_roles_flat == 1
+            
+            router_logits[expert_0_mask, 0] = 1e9
+            router_logits[expert_1_mask, 1] = 1e9
             
         elif hidden_states.dim() == 3:
             batch_size, seq_len, hidden_dim = hidden_states.shape
-            # Create logits: very high logit for selected expert, very low for others
+            # Create logits based on token roles
             router_logits = torch.full(
                 (batch_size, seq_len, self.num_experts),
                 -1e9,  # Very low logit
                 dtype=hidden_states.dtype,
                 device=hidden_states.device
             )
-            router_logits[:, :, expert_idx] = 1e9  # Very high logit for selected expert
+            
+            # Apply routing per token position
+            for i in range(seq_len):
+                if i < len(self.token_roles):
+                    if self.token_roles[i] == 0:  # user/system
+                        router_logits[:, i, 0] = 1e9
+                    elif self.token_roles[i] == 1:  # assistant
+                        router_logits[:, i, 1] = 1e9
         else:
             raise ValueError(f"Expected 2D or 3D input, got {hidden_states.dim()}D")
         
@@ -116,8 +127,7 @@ class RoleBasedMoEWrapper:
         
         # Replace routers with role-based routers
         self._replace_routers()
-        self.current_role = None
-    
+
     def _validate_model(self) -> bool:
         """Validate that the model has proper MoE structure."""
         print("Validating model structure...")
@@ -176,18 +186,66 @@ class RoleBasedMoEWrapper:
             if isinstance(module, RoleBasedRouter):
                 module.set_role(role)
                 
+    def set_token_roles(self, token_roles: torch.Tensor):
+        """Set the token-level role mapping for all routers."""
+        for module in self.model.modules():
+            if isinstance(module, RoleBasedRouter):
+                module.set_token_roles(token_roles)
+    
+    def parse_message_roles(self, text: str) -> torch.Tensor:
+        """Parse a formatted message string and create token-to-role mapping.
+        
+        Args:
+            text: Formatted message string with role markers
+            
+        Returns:
+            token_roles: Tensor mapping each token to a role (0=user/system, 1=assistant)
+        """
+        # Tokenize the full text
+        tokens = self.tokenizer(text, return_tensors='pt').input_ids[0]
+        token_roles = torch.zeros(len(tokens), dtype=torch.long, device=self.device)
+        
+        # Find role markers and map tokens to roles
+        # Look for patterns like <|im_start|>role or similar markers
+        text_parts = text.split('<|im_start|>')
+        current_pos = 0
+        
+        for part in text_parts:
+            if not part:
+                continue
+                
+            # Extract role from the part
+            if part.startswith('system') or part.startswith('user'):
+                role_val = 0  # Expert 0
+            elif part.startswith('assistant'):
+                role_val = 1  # Expert 1
+            else:
+                continue
+            
+            # Find tokens corresponding to this part
+            part_text = '<|im_start|>' + part if current_pos > 0 else part
+            part_tokens = self.tokenizer(part_text, add_special_tokens=False).input_ids
+            part_len = len(part_tokens)
+            
+            # Assign role to these token positions
+            end_pos = min(current_pos + part_len, len(token_roles))
+            token_roles[current_pos:end_pos] = role_val
+            current_pos = end_pos
+        
+        return token_roles
+                
     def generate_with_role(
         self, 
-        messages: List[Dict[str, str]], 
+        messages: str,  # Now accepts a single string
         max_new_tokens: int = 100,
         temperature: float = 0.7,
         do_sample: bool = True
     ) -> str:
         """
-        Generate text with role-based routing.
+        Generate text with role-based routing using a single forward pass.
         
         Args:
-            messages: List of message dicts with 'role' and 'content' keys
+            messages: Single formatted string with role markers
             max_new_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             do_sample: Whether to use sampling
@@ -195,35 +253,27 @@ class RoleBasedMoEWrapper:
         Returns:
             Generated text
         """
-        # Format messages for the model
-        if hasattr(self.tokenizer, 'apply_chat_template'):
-            formatted_text = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True
-            )
-        else:
-            # Fallback formatting
-            formatted_text = ""
-            for msg in messages:
-                formatted_text += f"<|im_start|>{msg['role']}\n{msg['content']}<|im_end|>\n"
-            formatted_text += "<|im_start|>assistant\n"
-        
-        # Set role for routing (use last message's role, or 'assistant' for generation)
-        if messages:
-            last_role = messages[-1]['role']
-            self.set_role(last_role)
+        # Parse token-to-role mapping
+        token_roles = self.parse_message_roles(messages)
+
+        breakpoint() 
+        # Set token roles for all routers
+        self.set_token_roles(token_roles)
         
         # Tokenize
         inputs = self.tokenizer(
-            formatted_text,
+            messages,
             return_tensors='pt',
             truncation=True,
             max_length=2048
         ).to(self.device)
         
-        # For generation, route through assistant expert
-        self.set_role('assistant')
+        # For new tokens during generation, use assistant role (1)
+        # Extend token_roles for generation
+        max_length = inputs['input_ids'].shape[1] + max_new_tokens
+        extended_roles = torch.ones(max_length, dtype=torch.long, device=self.device)
+        extended_roles[:len(token_roles)] = token_roles
+        self.set_token_roles(extended_roles)
         
         # Generate
         with torch.no_grad():
@@ -273,25 +323,33 @@ def test_role_based_routing():
         traceback.print_exc()
         return
     
-    # Single test case with system, user, and assistant
+    # Single test case as a formatted string
     print("\n2. Testing with complete conversation:\n")
     print(f"{'─'*80}")
     
-    test_messages = [
-        {"role": "system", "content": "You are a helpful AI assistant that provides clear and concise answers."},
-        {"role": "user", "content": "What is the capital of France?"}
-    ]
+    test_messages = """<|im_start|>system
+You are a helpful AI assistant that provides clear and concise answers.<|im_end|>
+<|im_start|>user
+What is the capital of France?<|im_end|>
+<|im_start|>assistant
+The capital of France is Paris.<|im_end|>
+<|im_start|>user
+How many people live in Paris?<|im_end|>
+<|im_start|>assistant
+"""
     
     # Show input messages
-    print("\nInput Messages:")
-    for msg in test_messages:
-        print(f"  [{msg['role'].upper()}]: {msg['content']}")
+    print("\nInput Message String:")
+    print("─"*40)
+    print(test_messages)
+    print("─"*40)
     
     print("\n" + "─"*80)
-    print("Routing Information:")
-    print("  • System message will route through Expert 0")
-    print("  • User message will route through Expert 0")
-    print("  • Assistant response will route through Expert 1")
+    print("Routing Information (Single Forward Pass):")
+    print("  • System tokens → Expert 0")
+    print("  • User tokens → Expert 0")  
+    print("  • Assistant tokens → Expert 1")
+    print("  • All routing decisions made per-token in parallel")
     print("─"*80)
     
     # Generate response
@@ -306,6 +364,7 @@ def test_role_based_routing():
         print(f"[ASSISTANT]: {response}")
         print("\n" + "─"*80)
         print("✓ Generation successful!")
+        print("  → All tokens routed in single forward pass")
         print("  → System/User tokens processed by Expert 0")
         print("  → Assistant tokens generated by Expert 1")
         
@@ -320,10 +379,11 @@ def test_role_based_routing():
     
     # Summary
     print("\n📊 Role-Based Routing Summary:")
-    print("   • System prompt    → Expert 0")
-    print("   • User question    → Expert 0")
-    print("   • Assistant answer → Expert 1")
-    print("\n   This enables role-specific specialization in the MoE model.")
+    print("   • Single forward pass for entire conversation")
+    print("   • Per-token routing based on role markers")
+    print("   • System/User tokens → Expert 0")
+    print("   • Assistant tokens → Expert 1")
+    print("\n   This enables efficient role-specific specialization in the MoE model.")
 
 
 def simple_routing_test():

@@ -19,6 +19,7 @@ from typing import Optional, Dict, List
 import torch
 import torch.nn.functional as F
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from safetensors.torch import save_file  # Add this import
 
 
 
@@ -149,7 +150,7 @@ def upcycle_mlp_to_moe(model, n_experts: int = 2, init_strategy: str = 'uniform'
 
 def save_moe_model(output_dir: Path, config_dict: dict, state_dict: dict, tokenizer):
     """
-    Save the MoE model to disk.
+    Save the MoE model to disk in safetensors format.
     
     Args:
         output_dir: Directory to save the model
@@ -163,8 +164,14 @@ def save_moe_model(output_dir: Path, config_dict: dict, state_dict: dict, tokeni
     with open(output_dir / 'config.json', 'w') as f:
         json.dump(config_dict, f, indent=2)
     
-    # Save model weights
-    torch.save(state_dict, output_dir / 'pytorch_model.bin')
+    # Handle shared tensors (tied embeddings) by cloning them
+    # This avoids the "tensors share memory" error
+    state_dict_to_save = {}
+    for key, tensor in state_dict.items():
+        state_dict_to_save[key] = tensor.clone().contiguous()
+    
+    # Save model weights in safetensors format (required for SafetensorLazyLoader)
+    save_file(state_dict_to_save, output_dir / 'model.safetensors')
     
     # Save tokenizer
     tokenizer.save_pretrained(output_dir)
