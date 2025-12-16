@@ -89,20 +89,12 @@ class BaseMegatronTrainer(ABC):
             data_parallel_size = mpu.get_data_parallel_world_size()
             step_batch_size = args.micro_batch_size * data_parallel_size
             num_generations = args.num_generations if args.rlhf_type == 'grpo' else 1
-            if args.save_strategy == 'epoch':
+            if args.train_iters is None and args.max_epochs is not None:
                 if hasattr(train_dataset, '__len__'):
-                    dataset_sample = len(train_dataset) // step_batch_size * step_batch_size * num_generations
-                    args.save_interval = dataset_sample // args.global_batch_size
-                    args.eval_interval = args.save_interval
-                    if getattr(args, 'save_retain_interval', None) is not None:
-                        args.save_retain_interval *= args.save_interval
-                else:
-                    raise ValueError('streaming dataset is not supported with `--save_strategy epoch`.')
-            if args.max_epochs is not None:
-                if hasattr(train_dataset, '__len__'):
-                    dataset_sample = len(train_dataset) // step_batch_size * step_batch_size * num_generations
+                    dataset_sample = len(train_dataset) // step_batch_size * step_batch_size
+                    dataset_sample = dataset_sample * num_generations
                     args.train_iters = dataset_sample * args.max_epochs // args.global_batch_size
-                elif args.train_iters is None:
+                else:
                     raise ValueError(
                         'You are using a streaming training dataset. Please explicitly specify `--train_iters`.')
             if args.eval_iters < 0:
@@ -130,27 +122,37 @@ class BaseMegatronTrainer(ABC):
             initialize.validate_args = origin_validate_args
 
     def new_cyclic_iter(self, iterable):
-        training = self.unwrapped_models[0].training
-        if not training:
-            yield from self._origin_cyclic_iter(iterable)
-            return
-
         args = get_args()
-        n_epoch = 0
-        is_finished = False
+        i = 0
+        n_batch = 0
         while True:
-            if not is_finished:
-                logger.info(f'The training of Epoch {n_epoch} starts...')
-            for x in iterable:
-                yield x
-            if training and args.max_epochs and n_epoch >= args.max_epochs - 1:
-                is_finished = True
-            n_epoch += 1
-            if is_finished:
-                # streaming
-                # Note that this approach will train for one additional step.
-                logger.info(f'Training of {n_epoch} epochs has been completed, the training has finished.')
-                args.train_iters = args.curr_iteration + 1
+            training = self.unwrapped_models[0].training
+            if training:
+                logger.info(f'The training of Epoch {i} starts...')
+            if training and args.max_epochs and i >= args.max_epochs - 1:
+                it = iter(iterable)
+                num_microbatches = args.global_batch_size // (args.micro_batch_size * args.data_parallel_size)
+                x = [next(it) for _ in range(num_microbatches - n_batch % num_microbatches)]
+                while True:
+                    try:
+                        next_x = [next(it) for _ in range(num_microbatches)]
+                    except StopIteration:
+                        break
+                    yield from x
+                    x = next_x
+                logger.info(f'Training of {i + 1} epochs has been completed, the training has finished.')
+                if isinstance(x, list) and all(isinstance(item, dict) for item in x):
+                    x[0]['is_finished'] = True
+                elif isinstance(x, list) and all(isinstance(item, list) for item in x):
+                    # grpo
+                    for item in x:
+                        item[0]['is_finished'] = True
+                yield from x
+            else:
+                for x in iterable:
+                    n_batch += 1
+                    yield x
+            i += 1
 
     def _replace_data_iterator(self, data_iterator, model):
         return data_iterator
@@ -421,30 +423,6 @@ class BaseMegatronTrainer(ABC):
             model = model_provider_func(*_args, **kwargs)
             if args.load_safetensors:
                 self.bridge.load_weights(model, args.model_dir)
-
-            if os.getenv('ROLE_BASED'): 
-                # replace the TopkRouter with RoleBasedRouter
-                from role_based_router import RoleBasedTopKRouter
-                from megatron.core.transformer.moe.router import TopKRouter
-                from megatron.core.transformer.moe.moe_utils import get_default_model_comm_pgs
-                pg = get_default_model_comm_pgs()
-                new_router = None
-
-                # replace the TopkRouter with RoleBasedRouter
-                for name, module in model.named_modules():
-                    if isinstance(module, TopKRouter):
-                        old_router = module
-                        if new_router is None:
-                            new_router = RoleBasedTopKRouter(
-                                config=old_router.config,
-                                model_comm_pgs=pg
-                            )
-                        module_idx = name.split('.')[-1]
-                        parent_module_name = '.'.join(name.split('.')[:-1])
-                        parent_module = deep_getattr(model, parent_module_name) if parent_module_name else model
-                        setattr(parent_module, module_idx, new_router)
-                        print_rank_0(f'Replaced TopKRouter with RoleBasedTopKRouter in {name}')
-
             self.unwrapped_models.append(model)
             peft_model = prepare_mcore_model(model)
             if args.load_safetensors and args.train_type == 'lora':
@@ -974,7 +952,7 @@ class BaseMegatronTrainer(ABC):
                     shutil.copy(args_path, os.path.join(output_dir, 'args.json'))
         else:
             with adapter_state_dict_context(is_peft_format=save_peft_format):
-                self._origin_save_checkpoint(iteration, *_args, **kwargs)
+                return self._origin_save_checkpoint(iteration, *_args, **kwargs)
         if args.train_type == 'lora' and args.merge_lora:
             self.unmerge_lora_adapters()
 
@@ -1071,4 +1049,9 @@ class BaseMegatronTrainer(ABC):
 
     def get_batch(self, data_iterator, vp_stage=None):
         """Generate a batch."""
-        return self._prepare_batch(next(data_iterator), vp_stage)
+        args = get_args()
+        data = next(data_iterator)
+        is_finished = data.pop('is_finished', False)
+        if is_finished:
+            args.train_iters = args.curr_iteration + 1
+        return self._prepare_batch(data, vp_stage)
