@@ -1177,7 +1177,7 @@ class Template(ProcessorMixin):
         return res_context_list, loss_scale_list, answer_len
 
     def _truncate(self, input_ids: List[int], labels: Optional[List[int]], loss_mask: Optional[List[float]],
-                  truncation_strategy: Literal['left', 'right'], roles: Optional[List[int]] = None):
+                  truncation_strategy: Literal['left', 'right']):
         placeholder_tokens = torch.tensor(self.placeholder_tokens)
         input_ids_tensor = torch.tensor(input_ids)
         protected = (input_ids_tensor[:, None] == placeholder_tokens).any(dim=-1)
@@ -1194,9 +1194,7 @@ class Template(ProcessorMixin):
             labels = torch.tensor(labels)[protected].tolist()
         if loss_mask is not None:
             loss_mask = torch.tensor(loss_mask)[protected].tolist()
-        if roles is not None:
-            roles = torch.tensor(roles)[protected].tolist()
-        return input_ids, labels, loss_mask, roles
+        return input_ids, labels, loss_mask
 
     @staticmethod
     def _get_length(input_ids, labels):
@@ -1227,12 +1225,11 @@ class Template(ProcessorMixin):
         input_ids = encoded.get('input_ids')
         labels = encoded.get('labels')
         loss_scale = encoded.get('loss_scale')
-        roles = encoded.get('roles')
         length = self._get_length(input_ids, labels)
         if self.max_length is not None and length > self.max_length:
             if self.truncation_strategy in {'right', 'left'}:
-                input_ids, labels, loss_scale, roles = self._truncate(
-                    input_ids, labels, loss_scale, truncation_strategy=self.truncation_strategy, roles=roles)
+                input_ids, labels, loss_scale = self._truncate(
+                    input_ids, labels, loss_scale, truncation_strategy=self.truncation_strategy)
                 length = self._get_length(input_ids, labels)
             elif self.truncation_strategy == 'raise':
                 raise MaxLengthError(f'Current length of row({length}) is larger'
@@ -1242,7 +1239,7 @@ class Template(ProcessorMixin):
                 batched = []
                 while i < length:
                     splited = {}
-                    for key in ['input_ids', 'labels', 'loss_scale', 'roles']:
+                    for key in ['input_ids', 'labels', 'loss_scale']:
                         value = encoded.get(key)
                         if value is not None:
                             value = value[i:i + self.max_length]
@@ -1261,8 +1258,6 @@ class Template(ProcessorMixin):
         encoded['input_ids'] = input_ids
         encoded['labels'] = labels
         encoded['loss_scale'] = loss_scale
-        if roles is not None:
-            encoded['roles'] = roles
         return encoded
 
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
@@ -1666,7 +1661,7 @@ class Template(ProcessorMixin):
         res = {}
         if self.padding_free:
             assert len(batch) == 1, f'batch: {batch}'
-            for k in ['input_ids', 'labels', 'position_ids', 'loss_scale', 'channel', 'roles']:
+            for k in ['input_ids', 'labels', 'position_ids', 'loss_scale', 'channel']:
                 v = batch[0].get(k)
                 if v is not None:
                     res[k] = v if k == 'channel' else [v]
@@ -1682,7 +1677,7 @@ class Template(ProcessorMixin):
             if any(channel):
                 res['channel'] = channel
 
-            for key in ['labels', 'loss_scale', 'position_ids', 'token_type_ids', 'roles']:
+            for key in ['labels', 'loss_scale', 'position_ids', 'token_type_ids']:
                 val = [b[key] for b in batch if b.get(key) is not None]
                 if val:
                     res[key] = val
@@ -1696,9 +1691,8 @@ class Template(ProcessorMixin):
             'position_ids',
             'token_type_ids',
             'attention_mask_2d',
-            'roles',
         ]
-        pad_values = [self.tokenizer.pad_token_id, 0., 0, -100, 0., 0., 0, 0, 0]
+        pad_values = [self.tokenizer.pad_token_id, 0., 0, -100, 0., 0., 0, 0]
         # Convert to tensor and remove unnecessary dimensions.
         seq_lens = None
         for key in keys:
