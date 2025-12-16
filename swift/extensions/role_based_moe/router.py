@@ -101,13 +101,13 @@ class RoleBasedTopKRouter(TopKRouter):
             )
 
         # Create expert assignment tensor
-        roles = token_roles.new_zeros(token_roles.size())
+        # setting to -1 to ensure that all tokens are replaced.
+        roles = token_roles.new_zeros(token_roles.size()) - 1
         roles[system_and_user] = 0
         roles[assistant] = 1
         roles[~valid_roles] = 0  # Assign unexpected roles to expert 0
-
-        # Store in [seq_len, batch_size] format to match Megatron's convention
-        self.token_routing = roles.transpose(0, 1).contiguous()
+        
+        self.token_routing = roles
 
         logger.debug(
             f"Set token roles: {system_and_user.sum()} system/user tokens, "
@@ -131,6 +131,7 @@ class RoleBasedTopKRouter(TopKRouter):
         Raises:
             RuntimeError: If token_routing has not been set via set_token_roles()
         """
+
         if self.token_routing is None:
             raise RuntimeError(
                 "Token roles have not been set. Call set_token_roles() before routing."
