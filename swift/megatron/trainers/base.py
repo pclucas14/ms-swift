@@ -1049,9 +1049,4 @@ class BaseMegatronTrainer(ABC):
 
     def get_batch(self, data_iterator, vp_stage=None):
         """Generate a batch."""
-        args = get_args()
-        data = next(data_iterator)
-        is_finished = data.pop('is_finished', False)
-        if is_finished:
-            args.train_iters = args.curr_iteration + 1
-        return self._prepare_batch(data, vp_stage)
+        return self._prepare_batch(next(data_iterator), vp_stage)
