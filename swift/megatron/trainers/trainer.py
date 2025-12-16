@@ -1,5 +1,6 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 from functools import partial
+import os
 from typing import List, Optional
 
 import torch
@@ -139,6 +140,17 @@ class MegatronTrainer(BaseMegatronTrainer):
         timers('batch-generator', log_level=2).start()
         with self.stimer(bdata=True):
             data = self.get_batch(data_iterator, vp_stage)
+        
+        # Here, we feed the role information to the routers. 
+        roles = data.pop('roles', None)
+        if os.getenv('ROLE_BASED'): 
+            assert roles is not None, "Role information is missing in the batch data."
+            from role_based_router import RoleBasedTopKRouter
+            for name, module in model.named_modules():
+                if isinstance(module, RoleBasedTopKRouter):
+                    module.set_token_roles(roles)
+                    logger.debug(f"Set role_ids on {name}")
+
         timers('batch-generator').stop()
         loss_scale = data.pop('loss_scale', None)
         channels = data.pop('channel', None)

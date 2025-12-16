@@ -38,6 +38,11 @@ if TYPE_CHECKING:
 class MaxLengthError(ValueError):
     pass
 
+# creat
+class RoleEnum:
+    system: int = 0
+    user: int = 1
+    assistant: int = 2
 
 class Template(ProcessorMixin):
     special_tokens = ['<image>', '<video>', '<audio>', '<bbox>', '<ref-object>', '<cot-process>', '<start-image>']
@@ -569,7 +574,7 @@ class Template(ProcessorMixin):
             keys.update(r.keys())
             length.append(r['length'])
         for key in keys:
-            if key in {'input_ids', 'labels', 'loss_scale'}:
+            if key in {'input_ids', 'labels', 'loss_scale', 'roles'}:
                 packed[key] = sum((x.get(key) or [] for x in row), start=[])
             elif key == 'length':
                 packed[key] = sum((x[key] for x in row))
@@ -958,23 +963,35 @@ class Template(ProcessorMixin):
         input_ids: List[int] = []
         labels: List[int] = []
         loss_scale: List[float] = []
+        roles: List[int] = []
         if loss_scale_list is None:
             loss_scale_list = [0.] * len(context_list)
         for i, (context, loss_weight) in enumerate(zip(context_list, loss_scale_list)):
+            if i == 0: 
+                expected_role = RoleEnum.system
+            elif i % 2 == 0:
+                expected_role = RoleEnum.user
+            else:
+                expected_role = RoleEnum.assistant
+
             if isinstance(context, str):
                 token_list = self._tokenize(context)
             else:
                 token_list = context
             input_ids += token_list
+            # TODO: add the data info here.
             if loss_scale_list[i] > 0.0:
                 labels += token_list
             else:
                 labels += [-100] * len(token_list)
+
+            roles.extend([expected_role] * len(token_list))
+
             if not self.loss_scale.is_loss_scale_binary:
                 loss_scale.extend([loss_weight] * len(token_list))
         if self.loss_scale.is_loss_scale_binary:
             loss_scale = None
-        return input_ids, labels, loss_scale
+        return input_ids, labels, loss_scale, roles
 
     @staticmethod
     def _add_dynamic_eos(input_ids: List[int], labels: List[int], loss_scale: Optional[List[int]],
@@ -1178,7 +1195,7 @@ class Template(ProcessorMixin):
         return res_context_list, loss_scale_list, answer_len
 
     def _truncate(self, input_ids: List[int], labels: Optional[List[int]], loss_scale: Optional[List[float]],
-                  truncation_strategy: Literal['left', 'right']):
+                  truncation_strategy: Literal['left', 'right'], roles: Optional[List[int]] = None):
         placeholder_tokens = torch.tensor(self.placeholder_tokens)
         input_ids_tensor = torch.tensor(input_ids)
         protected = (input_ids_tensor[:, None] == placeholder_tokens).any(dim=-1)
@@ -1197,7 +1214,9 @@ class Template(ProcessorMixin):
         if loss_scale is not None:
             loss_scale = torch.tensor(loss_scale)[protected].tolist()
             loss_scale[0] = 0
-        return input_ids, labels, loss_scale
+        if roles is not None:
+            roles = torch.tensor(roles)[protected].tolist()
+        return input_ids, labels, loss_scale, roles
 
     @staticmethod
     def _get_length(input_ids, labels):
@@ -1228,11 +1247,12 @@ class Template(ProcessorMixin):
         input_ids = encoded.get('input_ids')
         labels = encoded.get('labels')
         loss_scale = encoded.get('loss_scale')
+        roles = encoded.get('roles')
         length = self._get_length(input_ids, labels)
         if self.max_length is not None and length > self.max_length:
             if self.truncation_strategy in {'right', 'left'}:
-                input_ids, labels, loss_scale = self._truncate(
-                    input_ids, labels, loss_scale, truncation_strategy=self.truncation_strategy)
+                input_ids, labels, loss_scale, roles = self._truncate(
+                    input_ids, labels, loss_scale, truncation_strategy=self.truncation_strategy, roles=roles)
                 length = self._get_length(input_ids, labels)
             elif self.truncation_strategy == 'raise':
                 raise MaxLengthError(f'Current length of row({length}) is larger'
@@ -1242,7 +1262,7 @@ class Template(ProcessorMixin):
                 batched = []
                 while i < length:
                     splited = {}
-                    for key in ['input_ids', 'labels', 'loss_scale']:
+                    for key in ['input_ids', 'labels', 'loss_scale', 'roles']:
                         value = encoded.get(key)
                         if value is not None:
                             value = value[i:i + self.max_length]
@@ -1261,6 +1281,7 @@ class Template(ProcessorMixin):
         encoded['input_ids'] = input_ids
         encoded['labels'] = labels
         encoded['loss_scale'] = loss_scale
+        encoded['roles'] = roles
         return encoded
 
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
@@ -1280,7 +1301,7 @@ class Template(ProcessorMixin):
                                     slice(total_len - answer_len, total_len)]):
                 context_list, loss_scale = self._simplify_context_list(res_context_list[_slice],
                                                                        loss_scale_list[_slice], inputs)
-                input_ids, labels, loss_scale = self._encode_context_list(context_list, loss_scale)
+                input_ids, labels, loss_scale, _ = self._encode_context_list(context_list, loss_scale)
                 encoded[f'{key}_input_ids'] = input_ids
                 encoded[f'{key}_labels'] = labels
                 encoded[f'{key}_loss_scale'] = loss_scale
@@ -1291,9 +1312,11 @@ class Template(ProcessorMixin):
                 loss_scale = encoded['prompt_loss_scale'] + encoded['answer_loss_scale']
         else:
             res_context_list, loss_scale_list = self._simplify_context_list(res_context_list, loss_scale_list, inputs)
-            input_ids, labels, loss_scale = self._encode_context_list(res_context_list, loss_scale_list)
+            input_ids, labels, loss_scale, roles = self._encode_context_list(res_context_list, loss_scale_list)
+
         self._add_dynamic_eos(input_ids, labels, loss_scale, self._encode_context_list(self.template_meta.suffix)[0])
 
+        encoded['roles'] = roles
         encoded['input_ids'] = input_ids
         encoded['labels'] = labels
         encoded['loss_scale'] = loss_scale
@@ -1664,7 +1687,7 @@ class Template(ProcessorMixin):
         res = {}
         if self.padding_free:
             assert len(batch) == 1, f'batch: {batch}'
-            for k in ['input_ids', 'labels', 'position_ids', 'loss_scale', 'channel']:
+            for k in ['input_ids', 'labels', 'position_ids', 'loss_scale', 'channel', 'roles']:
                 v = batch[0].get(k)
                 if v is not None:
                     res[k] = v if k == 'channel' else [v]
@@ -1680,7 +1703,7 @@ class Template(ProcessorMixin):
             if any(channel):
                 res['channel'] = channel
 
-            for key in ['labels', 'loss_scale', 'position_ids', 'token_type_ids']:
+            for key in ['labels', 'loss_scale', 'position_ids', 'token_type_ids', 'roles']:
                 val = [b[key] for b in batch if b.get(key) is not None]
                 if val:
                     res[key] = val
@@ -1694,8 +1717,9 @@ class Template(ProcessorMixin):
             'position_ids',
             'token_type_ids',
             'attention_mask_2d',
+            'roles'
         ]
-        pad_values = [self.tokenizer.pad_token_id, 0., 0, -100, 0., 0., 0, 0]
+        pad_values = [self.tokenizer.pad_token_id, 0., 0, -100, 0., 0., 0, 0, -100]
         # Convert to tensor and remove unnecessary dimensions.
         seq_lens = None
         for key in keys:

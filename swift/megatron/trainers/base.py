@@ -421,6 +421,30 @@ class BaseMegatronTrainer(ABC):
             model = model_provider_func(*_args, **kwargs)
             if args.load_safetensors:
                 self.bridge.load_weights(model, args.model_dir)
+
+            if os.getenv('ROLE_BASED'): 
+                # replace the TopkRouter with RoleBasedRouter
+                from role_based_router import RoleBasedTopKRouter
+                from megatron.core.transformer.moe.router import TopKRouter
+                from megatron.core.transformer.moe.moe_utils import get_default_model_comm_pgs
+                pg = get_default_model_comm_pgs()
+                new_router = None
+
+                # replace the TopkRouter with RoleBasedRouter
+                for name, module in model.named_modules():
+                    if isinstance(module, TopKRouter):
+                        old_router = module
+                        if new_router is None:
+                            new_router = RoleBasedTopKRouter(
+                                config=old_router.config,
+                                model_comm_pgs=pg
+                            )
+                        module_idx = name.split('.')[-1]
+                        parent_module_name = '.'.join(name.split('.')[:-1])
+                        parent_module = deep_getattr(model, parent_module_name) if parent_module_name else model
+                        setattr(parent_module, module_idx, new_router)
+                        print_rank_0(f'Replaced TopKRouter with RoleBasedTopKRouter in {name}')
+
             self.unwrapped_models.append(model)
             peft_model = prepare_mcore_model(model)
             if args.load_safetensors and args.train_type == 'lora':
