@@ -17,25 +17,27 @@ from typing import TYPE_CHECKING
 from swift.utils.import_utils import _LazyModule
 
 if TYPE_CHECKING:
-    from .pipelines import megatron_export_main, megatron_sft_main, megatron_pretrain_main, megatron_rlhf_main
+    from .pipelines import (megatron_export_main, megatron_sft_main, megatron_pretrain_main, 
+                            megatron_rlhf_main, megatron_sparse_distill_main)
     from .convert import convert_hf2mcore, convert_mcore2hf
     from .utils import prepare_mcore_model, adapter_state_dict_context, convert_hf_config
     from .arguments import (MegatronSftArguments, MegatronPretrainArguments, MegatronRLHFArguments,
-                            MegatronExportArguments, MegatronArguments)
+                            MegatronExportArguments, MegatronArguments, MegatronSparseDistillArguments)
     from .model import MegatronModelType, MegatronModelMeta, get_megatron_model_meta, register_megatron_model
-    from .trainers import MegatronTrainer, MegatronDPOTrainer
+    from .trainers import MegatronTrainer, MegatronDPOTrainer, MegatronSparseDistillTrainer
     from .tuners import LoraParallelLinear
 else:
     _import_structure = {
-        'pipelines': ['megatron_sft_main', 'megatron_pretrain_main', 'megatron_rlhf_main', 'megatron_export_main'],
+        'pipelines': ['megatron_sft_main', 'megatron_pretrain_main', 'megatron_rlhf_main', 
+                      'megatron_export_main', 'megatron_sparse_distill_main'],
         'convert': ['convert_hf2mcore', 'convert_mcore2hf'],
         'utils': ['prepare_mcore_model', 'adapter_state_dict_context', 'convert_hf_config'],
         'arguments': [
             'MegatronSftArguments', 'MegatronPretrainArguments', 'MegatronRLHFArguments', 'MegatronExportArguments',
-            'MegatronArguments'
+            'MegatronArguments', 'MegatronSparseDistillArguments'
         ],
         'model': ['MegatronModelType', 'MegatronModelMeta', 'get_megatron_model_meta', 'register_megatron_model'],
-        'trainers': ['MegatronTrainer', 'MegatronDPOTrainer'],
+        'trainers': ['MegatronTrainer', 'MegatronDPOTrainer', 'MegatronSparseDistillTrainer'],
         'tuners': ['LoraParallelLinear'],
     }
 

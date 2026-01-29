@@ -118,7 +118,6 @@ def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
     """Slice batch input along sequence dimension into multiple chunks,
     which are parallelized across GPUs in a context parallel group.
     """
-
     # With causal masking, each token only attends to its prior tokens. Simply split
     # sequence into CP chunks can result in severe load imbalance. That's to say, chunks
     # at the end of sequence have bigger workload than others. To address this issue,
@@ -128,7 +127,11 @@ def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
     cp_size = mpu.get_context_parallel_world_size()
     if cp_size > 1:
         args = get_args()
-        keys = ['labels', 'attention_mask', 'position_ids', 'loss_scale']
+        
+        # Save original assistant_mask before splitting (needed for teacher data slicing)
+        original_assistant_mask = batch.get('assistant_mask')
+        
+        keys = ['labels', 'attention_mask', 'position_ids', 'loss_scale', 'assistant_mask']
         if not args.is_multimodal:
             # Multimodal models will handle CP in input_embeds.
             keys.append('input_ids')
@@ -141,7 +144,103 @@ def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
                 continue
             if val is not None:
                 batch[key] = split_cp_inputs(val, getattr(packed_seq_params, 'cu_seqlens_q', None), -1)
+        
+        # Handle sparse distillation teacher data (not sequence-aligned, needs index adjustment)
+        # Teacher data is already sparse (per-assistant-token), so we need to slice based on
+        # which assistant tokens fall into this CP rank's sequence portion
+        if 'teacher_top_k_tokens' in batch and original_assistant_mask is not None:
+            batch = _slice_sparse_distill_for_cp(batch, original_assistant_mask, packed_seq_params)
 
+    return batch
+
+
+def _slice_sparse_distill_for_cp(batch: Dict[str, Any], original_assistant_mask: torch.Tensor, packed_seq_params) -> Dict[str, Any]:
+    """Slice sparse distillation teacher data for context parallelism.
+    
+    Teacher data is stored per-assistant-token (sparse). When CP splits the sequence
+    using interleaved chunking (for load balance), we need to determine which teacher
+    entries belong to this rank's portion of the sequence.
+    
+    The approach:
+    1. Create an index tensor marking which teacher entry each sequence position maps to
+    2. Apply the same split_cp_inputs transformation to get this rank's indices
+    3. Use those indices to gather the corresponding teacher entries
+    """
+    cp_size = mpu.get_context_parallel_world_size()
+    cp_rank = mpu.get_context_parallel_rank()
+    
+    teacher_top_k_tokens = batch.get('teacher_top_k_tokens')
+    teacher_top_k_log_probs = batch.get('teacher_top_k_log_probs')
+    teacher_mask = batch.get('teacher_mask')
+    
+    if original_assistant_mask is None or teacher_top_k_tokens is None:
+        return batch
+    
+    batch_size, seq_len = original_assistant_mask.shape
+    device = original_assistant_mask.device
+    k = teacher_top_k_tokens.shape[-1]
+    
+    # Create a tensor that maps each sequence position to its teacher index (or -1 if not assistant)
+    # For each batch element, assistant positions get indices 0, 1, 2, ... and non-assistant get -1
+    teacher_idx_per_position = torch.full((batch_size, seq_len), -1, dtype=torch.long, device=device)
+    for b in range(batch_size):
+        assistant_positions = original_assistant_mask[b].nonzero(as_tuple=True)[0]
+        teacher_idx_per_position[b, assistant_positions] = torch.arange(len(assistant_positions), device=device)
+    
+    # Apply the same split_cp_inputs transformation to get this CP rank's teacher indices
+    cu_seqlens = getattr(packed_seq_params, 'cu_seqlens_q', None) if packed_seq_params else None
+    local_teacher_indices = split_cp_inputs(teacher_idx_per_position, cu_seqlens, -1)  # [batch, local_seq_len]
+    
+    # Extract the valid (non -1) teacher indices for this CP rank
+    # These are the teacher entries we need to keep
+    new_teacher_tokens_list = []
+    new_teacher_log_probs_list = []
+    new_teacher_mask_list = [] if teacher_mask is not None else None
+    max_local_assistant = 0
+    
+    for b in range(batch_size):
+        # Get teacher indices for this batch element's local sequence portion
+        local_indices = local_teacher_indices[b]
+        valid_indices = local_indices[local_indices >= 0]  # Filter out -1
+        max_local_assistant = max(max_local_assistant, len(valid_indices))
+        
+        if len(valid_indices) > 0:
+            new_teacher_tokens_list.append(teacher_top_k_tokens[b, valid_indices])
+            new_teacher_log_probs_list.append(teacher_top_k_log_probs[b, valid_indices])
+            if teacher_mask is not None:
+                new_teacher_mask_list.append(teacher_mask[b, valid_indices])
+        else:
+            new_teacher_tokens_list.append(torch.zeros(0, k, dtype=teacher_top_k_tokens.dtype, device=device))
+            new_teacher_log_probs_list.append(torch.zeros(0, k, dtype=teacher_top_k_log_probs.dtype, device=device))
+            if teacher_mask is not None:
+                new_teacher_mask_list.append(torch.zeros(0, dtype=teacher_mask.dtype, device=device))
+    
+    if max_local_assistant == 0:
+        # No assistant tokens in this CP rank's portion
+        batch['teacher_top_k_tokens'] = torch.zeros(batch_size, 0, k, dtype=teacher_top_k_tokens.dtype, device=device)
+        batch['teacher_top_k_log_probs'] = torch.zeros(batch_size, 0, k, dtype=teacher_top_k_log_probs.dtype, device=device)
+        if teacher_mask is not None:
+            batch['teacher_mask'] = torch.zeros(batch_size, 0, dtype=teacher_mask.dtype, device=device)
+        return batch
+    
+    # Pad to max_local_assistant and stack
+    new_teacher_tokens = torch.zeros(batch_size, max_local_assistant, k, dtype=teacher_top_k_tokens.dtype, device=device)
+    new_teacher_log_probs = torch.zeros(batch_size, max_local_assistant, k, dtype=teacher_top_k_log_probs.dtype, device=device)
+    new_teacher_mask = torch.zeros(batch_size, max_local_assistant, dtype=torch.bool, device=device) if teacher_mask is not None else None
+    
+    for b in range(batch_size):
+        length = new_teacher_tokens_list[b].shape[0]
+        if length > 0:
+            new_teacher_tokens[b, :length] = new_teacher_tokens_list[b]
+            new_teacher_log_probs[b, :length] = new_teacher_log_probs_list[b]
+            if teacher_mask is not None:
+                new_teacher_mask[b, :length] = new_teacher_mask_list[b]
+    
+    batch['teacher_top_k_tokens'] = new_teacher_tokens
+    batch['teacher_top_k_log_probs'] = new_teacher_log_probs
+    if new_teacher_mask is not None:
+        batch['teacher_mask'] = new_teacher_mask
+    
     return batch
 
 

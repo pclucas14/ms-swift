@@ -4,3 +4,4 @@ from .megatron_args import MegatronArguments
 from .pretrain_args import MegatronPretrainArguments
 from .rlhf_args import MegatronRLHFArguments
 from .sft_args import MegatronSftArguments
+from .sparse_distill_args import MegatronSparseDistillArguments

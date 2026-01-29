@@ -7,11 +7,13 @@ if TYPE_CHECKING:
     from .pretrain import megatron_pretrain_main
     from .rlhf import megatron_rlhf_main
     from .sft import megatron_sft_main
+    from .sparse_distill import megatron_sparse_distill_main
 else:
     _import_structure = {
         'pretrain': ['megatron_pretrain_main'],
         'rlhf': ['megatron_rlhf_main'],
         'sft': ['megatron_sft_main'],
+        'sparse_distill': ['megatron_sparse_distill_main'],
     }
     import sys
 

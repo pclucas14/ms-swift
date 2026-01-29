@@ -4,11 +4,11 @@ from typing import TYPE_CHECKING
 from swift.utils.import_utils import _LazyModule
 
 if TYPE_CHECKING:
-    from .train import megatron_pretrain_main, megatron_rlhf_main, megatron_sft_main
+    from .train import megatron_pretrain_main, megatron_rlhf_main, megatron_sft_main, megatron_sparse_distill_main
     from .export import megatron_export_main
 else:
     _import_structure = {
-        'train': ['megatron_pretrain_main', 'megatron_rlhf_main', 'megatron_sft_main'],
+        'train': ['megatron_pretrain_main', 'megatron_rlhf_main', 'megatron_sft_main', 'megatron_sparse_distill_main'],
         'export': ['megatron_export_main'],
     }
     import sys

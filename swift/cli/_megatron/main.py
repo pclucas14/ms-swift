@@ -10,6 +10,7 @@ ROUTE_MAPPING: Dict[str, str] = {
     'pt': 'swift.cli._megatron.pt',
     'sft': 'swift.cli._megatron.sft',
     'rlhf': 'swift.cli._megatron.rlhf',
+    'sparse-distill': 'swift.cli._megatron.sparse_distill',
     'export': 'swift.cli._megatron.export',
 }
 
